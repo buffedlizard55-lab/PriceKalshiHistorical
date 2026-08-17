@@ -1,0 +1,19 @@
+{
+  "name": "price-kalshi-historical",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Kalshi price history collector — autonomous live poller + historical backfill + backtesting",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "collector": "python3 -m collector.run",
+    "backfill": "python3 -m collector.backfill",
+    "backtest": "python3 -m backtest.strategy_example",
+    "collect:all": "concurrently \"node server/index.js\" \"python3 -m collector.run\"",
+    "dev": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {}
+}

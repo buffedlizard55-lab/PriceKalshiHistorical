@@ -1,0 +1,23 @@
+# runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+*.csv
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+
+# node
+node_modules/
+npm-debug.log
+
+# logs
+logs/
+*.log
