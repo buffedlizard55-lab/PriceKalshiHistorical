@@ -1,0 +1,48 @@
+version: "3.9"
+services:
+  exchange:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+      - exchange_data:/app/data
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+      - HOST=0.0.0.0
+      - KALSHI_API_BASE=${KALSHI_API_BASE:-https://api.elections.kalshi.com/trade-api/v2}
+      - SYNC_INTERVAL_MS=${SYNC_INTERVAL_MS:-15000}
+      - STARTING_BALANCE=${STARTING_BALANCE:-10000}
+      - DB_PATH=/app/data/exchange.db
+    command: node server/index.js
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  collector:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+      - exchange_data:/app/data
+    depends_on:
+      exchange:
+        condition: service_healthy
+    environment:
+      - KALSHI_API_BASE=${KALSHI_API_BASE:-https://api.elections.kalshi.com/trade-api/v2}
+      - LOCAL_API_BASE=http://exchange:8080
+      - DB_PATH=/app/data/exchange.db
+      - PARQUET_PATH=/app/data/parquet
+      - KALSHI_MAX_RPS=${KALSHI_MAX_RPS:-8}
+      - COLLECTOR_LOG_LEVEL=${COLLECTOR_LOG_LEVEL:-INFO}
+      - BACKFILL_ON_START=${BACKFILL_ON_START:-1}
+      - PYTHONUNBUFFERED=1
+    command: bash -lc "pip install -q requests pandas pyarrow duckdb python-dotenv >/dev/null 2>&1 || true; python -m collector.run"
+    restart: unless-stopped
+
+volumes:
+  exchange_data:

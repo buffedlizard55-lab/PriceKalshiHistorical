@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kalshi — trade on what's next</title>
+  <link rel="stylesheet" href="css/app.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2303d8a0'/%3E%3Ctext x='16' y='23' font-family='Arial,sans-serif' font-size='20' font-weight='800' text-anchor='middle' fill='%23052e22'%3EK%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <header id="topbar">
+    <div class="nav-inner">
+      <a class="logo" href="#/">kalshi<span class="logo-clone">clone</span></a>
+      <nav id="cat-nav"></nav>
+      <div class="nav-right">
+        <div class="search-wrap">
+          <input id="search" type="search" placeholder="Search markets" autocomplete="off">
+        </div>
+        <a href="#/analysis" class="nav-link">Analysis</a>
+        <a href="#/portfolio" class="nav-link">Portfolio</a>
+        <div id="balance-chip" class="balance-chip" title="Trading balance">$0.00</div>
+      </div>
+    </div>
+  </header>
+
+  <div id="sync-banner" class="sync-banner hidden"></div>
+
+  <main id="view"></main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <div>
+        <strong>kalshi clone</strong> — a prediction-market exchange simulator built for market-structure research.
+        Markets, quotes and fills run on a live exchange engine (in your browser on this static build; on the Node
+        server build the same frontend can mirror real upstream market data). Paper trading only — no real money.
+      </div>
+      <div class="footer-links">
+        <a href="#/markets">All markets</a>
+        <a href="#/analysis">Pricing analysis</a>
+        <a href="#/portfolio">Portfolio</a>
+      </div>
+    </div>
+  </footer>
+
+  <div id="toast-root"></div>
+
+  <script src="js/chart.js"></script>
+  <script src="js/exchange.js"></script>
+  <script src="js/localapi.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
