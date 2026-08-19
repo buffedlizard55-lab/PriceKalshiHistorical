@@ -7,11 +7,13 @@ import json
 import logging
 import time
 import sqlite3
+import urllib.parse
 from typing import List
 
 from . import config
-from .kalshi_client import KalshiClient, paginated_fetch
+from .kalshi_client import KalshiClient, paginated_fetch, fetch_with_retry
 from .storage import _connect, upsert_event, upsert_market, insert_candle, insert_trade, log_sync, set_collector_state, get_collector_state
+from .poller import _parse_kalshi_candle, _store_candles
 
 log = logging.getLogger("collector.backfill")
 
@@ -46,16 +48,12 @@ def backfill_events_and_markets(client: KalshiClient, conn: sqlite3.Connection, 
                 if not cursor:
                     break
             log.info("live markets fetched: %d across %d pages", len(all_markets), pages)
-            # also fetch events for those markets (optional)
+            # also fetch events for those markets (documented filter param is `tickers`)
             event_ids = list({m.get("event_ticker") for m in all_markets if m.get("event_ticker")})
             event_map = {}
             for i in range(0, len(event_ids), 50):
                 chunk = event_ids[i:i+50]
-                # events endpoint supports event_tickers filter per kalshiSync.js
-                j3, err3 = client.get_events(limit=50)  # fallback: fetch all events then filter would be heavy
-                # try with event_tickers param directly via raw fetch
-                from .kalshi_client import fetch_with_retry
-                code, jj, _ = fetch_with_retry(client.base, "/events", {"event_tickers": ",".join(chunk), "limit": 50}, timeout_ms=client.timeout_ms)
+                code, jj, _ = fetch_with_retry(client.base, "/events", {"tickers": ",".join(chunk), "limit": 50}, timeout_ms=client.timeout_ms)
                 if code == 200 and "events" in jj:
                     for e in jj["events"]:
                         event_map[e.get("event_ticker") or e.get("ticker")] = e
@@ -108,16 +106,20 @@ def backfill_events_and_markets(client: KalshiClient, conn: sqlite3.Connection, 
                     for m in markets:
                         try:
                             et = m.get("event_ticker") or ""
-                            upsert_event(conn, et, m.get("event_ticker") or et, "", "Other", "", 0, m.get("close_time") or "", et.lower())
+                            # don't clobber enriched event metadata if it exists
+                            if not conn.execute("SELECT 1 FROM events WHERE ticker = ?", (et,)).fetchone():
+                                upsert_event(conn, et, m.get("event_ticker") or et, "", "Other", "", 0, m.get("close_time") or "", et.lower())
                             yes_bid = _dollars(m.get("yes_bid_dollars"))
                             yes_ask = _dollars(m.get("yes_ask_dollars"))
                             last = _dollars(m.get("last_price_dollars"))
                             mid = (yes_bid+yes_ask)/2 if yes_bid and yes_ask else last
-                            # historical markets have result
+                            # historical markets carry the settlement label
                             status = m.get("status") or "settled"
+                            result = str(m.get("result") or "").upper()  # yes|no -> YES|NO
                             upsert_market(conn, m.get("ticker"), et, m.get("title") or m.get("ticker"),
                                           "Yes","No", status, m.get("close_time") or "", last, yes_bid, yes_ask, 0,0, mid,
-                                          _fp(m.get("volume_fp")), _fp(m.get("volume_24h_fp")), _fp(m.get("open_interest_fp")), last, "kalshi")
+                                          _fp(m.get("volume_fp")), _fp(m.get("volume_24h_fp")), _fp(m.get("open_interest_fp")), last, "kalshi",
+                                          result=result)
                             fetched_hist += 1
                         except Exception as e:
                             log.debug("hist market upsert fail: %s", e)
@@ -139,10 +141,34 @@ def backfill_events_and_markets(client: KalshiClient, conn: sqlite3.Connection, 
             log_sync(conn, "ok", f"historical markets backfill {fetched_hist}")
     return total
 
+def _series_for_market(conn, ticker):
+    try:
+        row = conn.execute(
+            "SELECT e.series FROM events e JOIN markets m ON m.event_ticker = e.ticker WHERE m.ticker = ?",
+            (ticker,),
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+def _candles_via_series(client, conn, ticker, period, start_ts, end_ts):
+    """GET /series/{series_ticker}/markets/{ticker}/candlesticks (documented single-market path)."""
+    series = _series_for_market(conn, ticker)
+    if not series:
+        return None
+    path = f"/series/{urllib.parse.quote(series, safe='')}/markets/{urllib.parse.quote(ticker, safe='')}/candlesticks"
+    params = {"period_interval": period}
+    if start_ts is not None:
+        params["start_ts"] = start_ts
+    if end_ts is not None:
+        params["end_ts"] = end_ts
+    code, j, _ = fetch_with_retry(client.base, path, params, timeout_ms=client.timeout_ms)
+    return j if code == 200 and isinstance(j, dict) else None
+
 def backfill_candles(client: KalshiClient, conn: sqlite3.Connection, tickers: List[str] = None, lookback_days: int = None):
     """Backfill 1m/1h/1d candles for tickers. If tickers is None, uses top volume markets."""
     if tickers is None:
-        cur = conn.execute("SELECT ticker FROM markets WHERE status='open' ORDER BY volume_24h DESC LIMIT 80")
+        cur = conn.execute("SELECT ticker FROM markets WHERE status IN ('open','active') ORDER BY volume_24h DESC LIMIT 80")
         tickers = [r[0] for r in cur.fetchall()]
         if not tickers:
             log.info("no tickers for candle backfill")
@@ -159,87 +185,34 @@ def backfill_candles(client: KalshiClient, conn: sqlite3.Connection, tickers: Li
         for i in range(0, len(tickers), 20):
             batch = tickers[i:i+20]
             j, err = client.get_candlesticks(batch, period, start_ts, end_ts)
-            if j and ("market_candlesticks" in j or "candlesticks" in j):
-                # normalize variants
-                mcs = j.get("market_candlesticks") or j.get("candlesticks") or []
-                # Kalshi batch returns list of list or dict keyed by ticker
+            stored = 0
+            if j:
+                # current documented shape: {"markets": [{market_ticker, candlesticks}]}
+                # legacy shapes (dict keyed by ticker / list of entries) still tolerated
+                mcs = j.get("markets") or j.get("market_candlesticks") or j.get("candlesticks") or []
                 if isinstance(mcs, dict):
                     for tk, candles in mcs.items():
-                        for c in candles or []:
-                            try:
-                                # candles may have shape {end_period_ts, price:{...}, volume_fp,...} or {t_open,o,h,l,c,v}
-                                t_open = c.get("end_period_ts") or c.get("t_open") or c.get("t")
-                                if t_open and t_open > 1e12: t_open = int(t_open)
-                                elif t_open and t_open < 1e12: # seconds -> ms
-                                    # Kalshi often returns seconds; convert to ms
-                                    if t_open < 1e10:
-                                        t_open = int(t_open*1000)
-                                o = _dollars((c.get("price") or {}).get("open_dollars") or c.get("o"))
-                                h = _dollars((c.get("price") or {}).get("high_dollars") or c.get("h"))
-                                l = _dollars((c.get("price") or {}).get("low_dollars") or c.get("l"))
-                                cl = _dollars((c.get("price") or {}).get("close_dollars") or c.get("c") or c.get("close"))
-                                v = _fp(c.get("volume_fp") or c.get("v") or 0)
-                                if t_open and cl:
-                                    insert_candle(conn, tk, interval_label, t_open, o or cl, h or cl, l or cl, cl, v)
-                                    total += 1
-                            except Exception as e:
-                                log.debug("candle insert fail: %s", e)
+                        stored += _store_candles(conn, tk, candles or [], interval_label)
                 elif isinstance(mcs, list):
-                    # Could be list per ticker or list of candle objects with ticker field
                     for entry in mcs:
-                        if isinstance(entry, list):
-                            # list of candles for batch[t] — need mapping; assume order matches batch
-                            idx = mcs.index(entry)
-                            tk = batch[idx] if idx < len(batch) else "unknown"
-                            for c in entry:
-                                try:
-                                    t_open = c.get("end_period_ts") or c.get("t_open")
-                                    if t_open and t_open < 1e10: t_open = int(t_open*1000)
-                                    o = _dollars((c.get("price") or {}).get("open_dollars") or c.get("o"))
-                                    h = _dollars((c.get("price") or {}).get("high_dollars") or c.get("h"))
-                                    l = _dollars((c.get("price") or {}).get("low_dollars") or c.get("l"))
-                                    cl = _dollars((c.get("price") or {}).get("close_dollars") or c.get("c"))
-                                    v = _fp(c.get("volume_fp") or c.get("v"))
-                                    if t_open and cl:
-                                        insert_candle(conn, tk, interval_label, int(t_open), o or cl, h or cl, l or cl, cl, v)
-                                        total += 1
-                                except: pass
-                        elif isinstance(entry, dict) and "ticker" in entry:
-                            tk = entry.get("ticker")
-                            candles = entry.get("candlesticks") or entry.get("candles") or []
-                            for c in candles:
-                                try:
-                                    t_open = c.get("end_period_ts") or c.get("t_open")
-                                    if t_open and t_open < 1e10: t_open = int(t_open*1000)
-                                    o = _dollars(c.get("open_dollars") or (c.get("price") or {}).get("open_dollars"))
-                                    h = _dollars(c.get("high_dollars") or (c.get("price") or {}).get("high_dollars"))
-                                    l = _dollars(c.get("low_dollars") or (c.get("price") or {}).get("low_dollars"))
-                                    cl = _dollars(c.get("close_dollars") or (c.get("price") or {}).get("close_dollars") or c.get("c"))
-                                    v = _fp(c.get("volume_fp") or c.get("v"))
-                                    if t_open and cl:
-                                        insert_candle(conn, tk, interval_label, int(t_open), o or cl, h or cl, l or cl, cl, v)
-                                        total += 1
-                                except: pass
+                        if not isinstance(entry, dict):
+                            continue
+                        tk = entry.get("market_ticker") or entry.get("ticker")
+                        candles = entry.get("candlesticks") or entry.get("candles")
+                        if tk and isinstance(candles, list):
+                            stored += _store_candles(conn, tk, candles, interval_label)
+                total += stored
                 conn.commit()
-            else:
-                log.debug("candles batch failed period %s tickers %s: %s", period, batch[:2], str(err or j)[:300])
-                # fallback per-ticker via historical candlesticks if available
+            if not stored:
+                log.debug("candles batch empty/failed period %s tickers %s: %s", period, batch[:2], str(err or j)[:300])
+                # per-ticker fallback: series path (documented), then historical archive
                 for tk in batch:
-                    jj, ee = client.get_historical_candlesticks(tk, period, start_ts, end_ts)
-                    if jj and "candlesticks" in jj:
-                        for c in jj["candlesticks"]:
-                            try:
-                                t_open = c.get("end_period_ts") or c.get("t_open")
-                                if t_open and t_open < 1e10: t_open = int(t_open*1000)
-                                o = _dollars((c.get("price") or {}).get("open_dollars"))
-                                h = _dollars((c.get("price") or {}).get("high_dollars"))
-                                l = _dollars((c.get("price") or {}).get("low_dollars"))
-                                cl = _dollars((c.get("price") or {}).get("close_dollars"))
-                                v = _fp(c.get("volume_fp"))
-                                if t_open and cl:
-                                    insert_candle(conn, tk, interval_label, int(t_open), o or cl, h or cl, l or cl, cl, v)
-                                    total += 1
-                            except: pass
+                    jj = _candles_via_series(client, conn, tk, period, start_ts, end_ts)
+                    if not jj:
+                        jj, ee = client.get_historical_candlesticks(tk, period, start_ts, end_ts)
+                    if jj and isinstance(jj.get("candlesticks"), list):
+                        n = _store_candles(conn, tk, jj["candlesticks"], interval_label)
+                        total += n
                         conn.commit()
                     time.sleep(0.1)
             time.sleep(0.3)
@@ -279,7 +252,7 @@ def backfill_trades(client: KalshiClient, conn: sqlite3.Connection, max_pages=15
                             ts = int(time.time()*1000)
                     else:
                         ts = int(time.time()*1000)
-                    side = t.get("taker_side") or t.get("side") or ""
+                    side = t.get("taker_outcome_side") or t.get("taker_side") or t.get("side") or ""
                     insert_trade(conn, ts, ticker, price, size, side, "kalshi", t)
                     total += 1
                 except Exception as e:
@@ -317,13 +290,14 @@ def backfill_trades(client: KalshiClient, conn: sqlite3.Connection, max_pages=15
                         ticker = t.get("ticker")
                         price = _dollars(t.get("yes_price_dollars"))
                         size = _fp(t.get("count_fp"))
+                        side = t.get("taker_outcome_side") or t.get("taker_side") or ""
                         ts_raw = t.get("created_time")
                         import datetime
                         try:
                             ts = int(datetime.datetime.fromisoformat(ts_raw.replace("Z","+00:00")).timestamp()*1000)
                         except:
                             ts = int(time.time()*1000)
-                        insert_trade(conn, ts, ticker, price, size, "", "kalshi", t)
+                        insert_trade(conn, ts, ticker, price, size, side, "kalshi", t)
                         hist_total += 1
                     except: pass
                 conn.commit()

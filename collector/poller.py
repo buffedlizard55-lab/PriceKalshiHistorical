@@ -28,6 +28,116 @@ def _fp(x):
     try: return float(x)
     except: return 0.0
 
+# --- Kalshi orderbook payload parsing (current documented schema) ---
+# Current API (docs.kalshi.com OpenAPI v3.28.0):
+#   single: {"orderbook_fp": {"yes_dollars": [[price_str, count_fp_str], ...],
+#                             "no_dollars":  [[price_str, count_fp_str], ...]}}
+#   batch : {"orderbooks": [{"ticker": ..., "orderbook_fp": {...}}, ...]}
+# The book is BIDS ONLY: yes_dollars = YES bids; no_dollars = NO bids.
+# A NO bid at q is a YES ask at (1-q), so YES asks are derived from NO bids.
+def _as_book_payload(payload):
+    if isinstance(payload, dict):
+        for key in ("orderbook_fp", "orderbook", "book"):
+            v = payload.get(key)
+            if isinstance(v, dict):
+                return v
+    return payload
+
+def _normalize_books_response(j):
+    """Normalize GET /markets/orderbooks responses to {ticker: book_payload}."""
+    books = {}
+    if not isinstance(j, dict):
+        return books
+    raw = j.get("orderbooks")
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            tk = entry.get("ticker") or entry.get("market_ticker")
+            if tk:
+                books[tk] = _as_book_payload(entry)
+    elif isinstance(raw, dict):
+        books = {tk: _as_book_payload(p) for tk, p in raw.items()}
+    return books
+
+def parse_kalshi_book(payload):
+    """Parse a Kalshi orderbook payload into yes-side ([bids], [asks]) in dollars.
+
+    Handles current {yes_dollars, no_dollars}, legacy cents {yes, no}, and
+    third-party-shaped {yes_bids/yes_asks} payloads. Returns (bids, asks).
+    """
+    def conv(levels):
+        out = []
+        for lvl in levels or []:
+            try:
+                if isinstance(lvl, dict):
+                    p, s = lvl.get("price"), lvl.get("size")
+                elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                    p, s = lvl[0], lvl[1]
+                else:
+                    continue
+                p, s = float(p), float(s)
+                if p > 1.5:  # legacy integer cents
+                    p /= 100.0
+                if 0 < p < 1.5 and s > 0:
+                    out.append([round(p, 4), round(s, 4)])
+            except Exception:
+                continue
+        return out
+    if not isinstance(payload, dict):
+        return [], []
+    payload = _as_book_payload(payload)
+    yes_bids = conv(payload.get("yes_dollars") or payload.get("yes") or payload.get("yes_bids") or payload.get("bids"))
+    explicit_asks = payload.get("yes_asks") or payload.get("asks")
+    if explicit_asks:
+        yes_asks = conv(explicit_asks)
+    else:
+        # derive YES asks from NO bids: yes_ask = 1 - no_bid (best NO bid = lowest YES ask)
+        no_bids = conv(payload.get("no_dollars") or payload.get("no"))
+        yes_asks = sorted([[round(1.0 - p, 4), s] for p, s in no_bids if 0 < p < 1.0])
+    return yes_bids, yes_asks
+
+# --- Kalshi candlestick parsing (current documented schema) ---
+def _parse_kalshi_candle(c):
+    """Parse a Kalshi MarketCandlestick dict -> (t_open_ms, o, h, l, cl, v) or None.
+
+    Current schema: {end_period_ts (unix seconds), price: {open/high/low/close_dollars},
+    volume_fp, open_interest_fp}. Tolerates legacy {t_open, o, h, l, c, v}.
+    """
+    if not isinstance(c, dict):
+        return None
+    try:
+        t_open = c.get("end_period_ts") or c.get("t_open")
+        if t_open is None:
+            return None
+        t_open = int(t_open)
+        if t_open < 1e10:  # unix seconds -> ms
+            t_open = int(t_open * 1000)
+        price = c.get("price") or {}
+        o = _dollars(price.get("open_dollars") or c.get("o"))
+        h = _dollars(price.get("high_dollars") or c.get("h"))
+        l = _dollars(price.get("low_dollars") or c.get("l"))
+        cl = _dollars(price.get("close_dollars") or c.get("c") or c.get("close"))
+        v = _fp(c.get("volume_fp") or c.get("v"))
+        return t_open, o, h, l, cl, v
+    except Exception:
+        return None
+
+def _store_candles(conn, ticker, candles, interval_label):
+    n = 0
+    for c in candles:
+        parsed = _parse_kalshi_candle(c)
+        if not parsed:
+            continue
+        t_open, o, h, l, cl, v = parsed
+        if cl:  # candles with no trades have null close — skip
+            try:
+                insert_candle(conn, ticker, interval_label, t_open, o or cl, h or cl, l or cl, cl, v)
+                n += 1
+            except Exception:
+                pass
+    return n
+
 class Poller:
     def __init__(self, client: KalshiClient = None, local_client: KalshiClient = None):
         self.client = client or KalshiClient(base=config.KALSHI_API_BASE)
@@ -90,7 +200,7 @@ class Poller:
         if not tickers:
             # fallback to DB
             try:
-                cur = self.conn.execute("SELECT ticker FROM markets WHERE status='open' ORDER BY volume_24h DESC LIMIT 120")
+                cur = self.conn.execute("SELECT ticker FROM markets WHERE status IN ('open','active') ORDER BY volume_24h DESC LIMIT 120")
                 tickers = [r[0] for r in cur.fetchall()]
             except Exception:
                 tickers = []
@@ -152,9 +262,12 @@ class Poller:
                 oi = _fp(m.get("open_interest_fp"))
                 prev = _fp(m.get("last_price_dollars"))  # approx
                 et = m.get("event_ticker") or ""
-                # ensure event exists (minimal)
+                # ensure event exists (minimal) — but never overwrite metadata
+                # that the backfill enriched (title/category/mutually_exclusive)
                 try:
-                    upsert_event(self.conn, et, et, "", "Other", "", 0, m.get("close_time") or "", et.lower())
+                    exists = self.conn.execute("SELECT 1 FROM events WHERE ticker = ?", (et,)).fetchone()
+                    if not exists:
+                        upsert_event(self.conn, et, et, "", "Other", "", 0, m.get("close_time") or "", et.lower())
                 except: pass
                 upsert_market(self.conn, ticker, et, m.get("title") or ticker,
                               m.get("yes_sub_title") or "Yes", m.get("no_sub_title") or "No",
@@ -196,68 +309,32 @@ class Poller:
         # rotate cache for next call
         if len(self.tickers_cache) > 40:
             self.tickers_cache = self.tickers_cache[40:] + self.tickers_cache[:40]
-        # Try batch endpoint
+        # Try batch endpoint (unsigned, then signed); client falls back to per-ticker
         j, err = self.client.get_orderbooks_batch(batch)
-        books = {}
-        if j and ("orderbooks" in j or "books" in j):
-            books = j.get("orderbooks") or j.get("books") or j.get("orderBooks") or {}
-            # normalize: if response is list of {ticker, orderbook}
-            if isinstance(books, list):
-                # try map
-                tmp = {}
-                for b in books:
-                    if isinstance(b, dict) and b.get("ticker"):
-                        tmp[b["ticker"]] = b.get("orderbook") or b.get("book") or b
-                books = tmp
-        else:
-            # per-ticker fallback (get_orderbooks_batch already does fallback)
-            # if still failing, try local fallback
-            if not books:
-                if self._try_local_fallback("books"):
-                    self.stats["fallbacks"] += 1
-                    return
-                log.debug("orderbook batch empty, fallback to per-ticker already attempted")
+        books = _normalize_books_response(j)
+        if not books:
+            if self._try_local_fallback("books"):
+                self.stats["fallbacks"] += 1
+                return
+            log.debug("orderbook batch empty: %s", str(err or j)[:300])
 
         inserted = 0
-        for tk, book in (books.items() if isinstance(books, dict) else []):
+        try:
+            quote_rows = self.conn.execute(
+                "SELECT ticker, yes_bid, yes_ask, yes_bid_size, yes_ask_size FROM markets").fetchall()
+        except Exception:
+            quote_rows = []
+        quotes = {r[0]: r for r in quote_rows}
+        for tk, payload in books.items():
             try:
-                # book may be {"yes": [[price,size],...], "no": [...]}  prices in cents or dollars
-                # normalize prices to dollars 0..1
-                bids = []
-                asks = []
-                if isinstance(book, dict):
-                    yes_levels = book.get("yes") or book.get("yes_bids") or []
-                    no_levels = book.get("no") or []
-                    # If yes levels look like cents (e.g., 42), convert
-                    for lvl in yes_levels:
-                        try:
-                            if isinstance(lvl, (list, tuple)) and len(lvl)>=2:
-                                p, s = float(lvl[0]), float(lvl[1])
-                                if p > 1.5: p = p/100  # cents → dollars
-                                bids.append([round(p,4), s])
-                            elif isinstance(lvl, dict):
-                                p, s = float(lvl.get("price",0)), float(lvl.get("size",0))
-                                if p > 1.5: p = p/100
-                                bids.append([round(p,4), s])
-                        except: pass
-                    # asks are yes asks — could be separate key yes_asks or from "yes" asks side inverted
-                    yes_asks = book.get("yes_asks") or book.get("asks") or []
-                    # If book has "yes" and we need to split bids/asks? Some docs return yes: bids as [[p,s]] where p is yes price, asks are implied as 1-bid? But real orderbook has both.
-                    # We'll attempt to read both.
-                    if yes_asks:
-                        for lvl in yes_asks:
-                            try:
-                                if isinstance(lvl, (list,tuple)):
-                                    p,s = float(lvl[0]), float(lvl[1])
-                                    if p>1.5: p=p/100
-                                    asks.append([round(p,4), s])
-                                elif isinstance(lvl, dict):
-                                    p,s = float(lvl.get("price",0)), float(lvl.get("size",0))
-                                    if p>1.5: p=p/100
-                                    asks.append([round(p,4), s])
-                            except: pass
-                    # If asks still empty but yes levels exist, try to infer asks as complementary NO bids?
-                    # For now keep bids as found, asks as found.
+                bids, asks = parse_kalshi_book(payload)
+                if not bids and not asks and tk in quotes:
+                    # keep book history advancing: synthesize a minimal book
+                    # from the latest quotes rather than store nothing
+                    q = quotes[tk]
+                    bids = [[q[1], q[3] or 1.0]] if q[1] else []
+                    asks = [[q[2], q[4] or 1.0]] if q[2] else []
+                    log.debug("book %s synthesized from quotes", tk)
                 if not bids and not asks:
                     continue
                 insert_book_snapshot(self.conn, now, tk, bids, asks)
@@ -298,7 +375,7 @@ class Poller:
                 ticker = t.get("ticker") or t.get("market_ticker")
                 price = _dollars(t.get("yes_price_dollars") or t.get("price_dollars") or t.get("price") or 0)
                 size = _fp(t.get("count_fp") or t.get("size") or 0)
-                side = t.get("taker_side") or t.get("side") or ""
+                side = t.get("taker_outcome_side") or t.get("taker_side") or t.get("side") or ""
                 ts_raw = t.get("created_time") or t.get("ts")
                 ts = now
                 if isinstance(ts_raw, (int,float)):
@@ -340,41 +417,21 @@ class Poller:
             log.debug("candles poll failed: %s", str(err)[:300])
             self.stats["failures"] += 1
             return
-        # similar handling as backfill — simplified: handle batch dict vs list
-        mcs = j.get("market_candlesticks") or j.get("candlesticks") or {}
+        # Current documented batch shape: {"markets": [{market_ticker, candlesticks}]}
+        # Older shapes (dict keyed by ticker / list of entries) still tolerated.
+        mcs = j.get("markets") or j.get("market_candlesticks") or j.get("candlesticks") or {}
         inserted = 0
         if isinstance(mcs, dict):
             for tk, candles in mcs.items():
-                for c in candles or []:
-                    try:
-                        t_open = c.get("end_period_ts") or c.get("t_open")
-                        if t_open and t_open < 1e10: t_open = int(t_open*1000)
-                        o = _dollars((c.get("price") or {}).get("open_dollars") or c.get("o"))
-                        h = _dollars((c.get("price") or {}).get("high_dollars") or c.get("h"))
-                        l_ = _dollars((c.get("price") or {}).get("low_dollars") or c.get("l"))
-                        cl = _dollars((c.get("price") or {}).get("close_dollars") or c.get("c"))
-                        v = _fp(c.get("volume_fp") or c.get("v"))
-                        if t_open and cl:
-                            insert_candle(self.conn, tk, "1m", int(t_open), o or cl, h or cl, l_ or cl, cl, v)
-                            inserted += 1
-                    except: pass
+                inserted += _store_candles(self.conn, tk, candles or [], "1m")
         elif isinstance(mcs, list):
             for entry in mcs:
-                if isinstance(entry, dict) and "candlesticks" in entry:
-                    tk = entry.get("ticker") or entry.get("market_ticker") or batch[0]
-                    for c in entry.get("candlesticks") or []:
-                        try:
-                            t_open = c.get("end_period_ts") or c.get("t_open")
-                            if t_open and t_open < 1e10: t_open = int(t_open*1000)
-                            o = _dollars((c.get("price") or {}).get("open_dollars"))
-                            h = _dollars((c.get("price") or {}).get("high_dollars"))
-                            l_ = _dollars((c.get("price") or {}).get("low_dollars"))
-                            cl = _dollars((c.get("price") or {}).get("close_dollars"))
-                            v = _fp(c.get("volume_fp"))
-                            if t_open and cl:
-                                insert_candle(self.conn, tk, "1m", int(t_open), o or cl, h or cl, l_ or cl, cl, v)
-                                inserted += 1
-                        except: pass
+                if not isinstance(entry, dict):
+                    continue
+                tk = entry.get("market_ticker") or entry.get("ticker")
+                candles = entry.get("candlesticks") or entry.get("candles")
+                if tk and isinstance(candles, list):
+                    inserted += _store_candles(self.conn, tk, candles, "1m")
         try:
             self.conn.commit()
         except: pass
