@@ -85,7 +85,7 @@ def _get_private_key():
             log.warning("KALSHI_ACCESS_KEY set but no valid private key — signed endpoints will fail")
     return _PRIVATE_KEY
 
-def _sign_request(method: str, path: str, timestamp_ms: str, body: str = "") -> Optional[str]:
+def _sign_request(method: str, path: str, timestamp_ms: str) -> Optional[str]:
     if not config.KALSHI_ACCESS_KEY:
         return None
     key = _get_private_key()
@@ -94,9 +94,10 @@ def _sign_request(method: str, path: str, timestamp_ms: str, body: str = "") -> 
     try:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
-        # Kalshi signs: timestamp + method + path + body (path includes query)
-        # See https://docs.kalshi.com / kalshi-python reference
-        msg = (timestamp_ms + method.upper() + path + body).encode()
+        # Kalshi signs: timestamp + method + path — the full path from the API
+        # root (/trade-api/v2/...) WITHOUT query parameters and WITHOUT the body.
+        # See https://docs.kalshi.com/getting_started/quick_start_authenticated_requests
+        msg = (timestamp_ms + method.upper() + path).encode()
         sig = key.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
         return base64.b64encode(sig).decode()
     except Exception as e:
@@ -116,8 +117,10 @@ def _do_fetch(base: str, path: str, params: dict = None, method="GET", body_obj=
         if clean:
             q = "?" + urllib.parse.urlencode(clean, doseq=True)
     url = base + path + q
-    # for signing, path must include query
-    sign_path = path + q
+    # Kalshi signs the path from the API root (/trade-api/v2/...) WITHOUT the
+    # query string. See docs.kalshi.com quick_start_authenticated_requests.
+    root = "/trade-api/v2" if "/trade-api/v2" in base else ""
+    sign_path = root + path
     body_str = ""
     headers = {"Accept": "application/json", "User-Agent": "PriceKalshiHistorical/1.0"}
     data = None
@@ -128,7 +131,7 @@ def _do_fetch(base: str, path: str, params: dict = None, method="GET", body_obj=
 
     if signed and config.KALSHI_ACCESS_KEY:
         ts = str(int(time.time()*1000))
-        sig = _sign_request(method, sign_path, ts, body_str)
+        sig = _sign_request(method, sign_path, ts)
         if sig:
             headers["KALSHI-ACCESS-KEY"] = config.KALSHI_ACCESS_KEY
             headers["KALSHI-ACCESS-TIMESTAMP"] = ts
@@ -269,30 +272,29 @@ class KalshiClient:
 
     def get_orderbooks_batch(self, tickers: List[str]):
         """
-        Try batch endpoint /markets/orderbooks?tickers=... if available (added 2026-03),
-        else fall back to single calls with throttling.
-        The batch endpoint name varies by docs: some say /markets/orderbooks, some /markets/orderbooks with tickers param.
+        GET /markets/orderbooks?tickers=a,b,... (documented param name; max 100
+        tickers). The OpenAPI spec lists auth for this endpoint; single-book
+        reads work unsigned in practice. Try unsigned first, then signed if
+        keys are configured, then fall back to per-ticker single calls.
+        Returns the raw JSON on success.
         """
         if not tickers:
             return {}, None
-        # Try batch first
-        joined = ",".join(tickers)
-        # endpoints seen: /markets/orderbooks and /markets/orderbooks?market_tickers= / ?tickers=
-        for path in ["/markets/orderbooks"]:
-            for param_name in ["tickers", "market_tickers", "ticker"]:
-                code, j, _ = fetch_with_retry(self.base, path, {param_name: joined}, timeout_ms=self.timeout_ms)
-                if code == 200 and ("orderbooks" in j or "markets" in j or "orderbook" in j or isinstance(j, dict) and any(k in j for k in ["orderbooks","books"])):
-                    return j, None
-                if code in (404, 405):
-                    continue
-                if code == 400 and "unknown" in str(j).lower():
-                    continue
-        # Fallback: single calls
+        joined = ",".join(tickers[:100])
+        signed_tries = [False] + ([True] if config.KALSHI_ACCESS_KEY else [])
+        for signed in signed_tries:
+            code, j, _ = fetch_with_retry(self.base, "/markets/orderbooks", {"tickers": joined},
+                                          timeout_ms=self.timeout_ms, signed=signed)
+            if code == 200 and isinstance(j, dict) and "orderbooks" in j:
+                return j, None
+            if code not in (401, 403):
+                break
+        # Fallback: single-ticker books (public in practice), throttled.
         out = {}
         for t in tickers:
             j, err = self.get_orderbook(t)
-            if j and "orderbook" in j:
-                out[t] = j["orderbook"]
+            if j:
+                out[t] = j.get("orderbook") or j.get("orderbook_fp") or j
             time.sleep(0.06)  # ~16 rps inter-call spacing
         return {"orderbooks": out}, None
 
@@ -324,46 +326,31 @@ class KalshiClient:
 
     def get_candlesticks(self, tickers: List[str], period_interval: int, start_ts: int = None, end_ts: int = None):
         """
-        Batch candles: documented as GET /markets/candlesticks
-        Query examples vary. Try several param combos.
-        period_interval: 1, 60, 1440
-        start_ts/end_ts: unix seconds
+        Batch candles: GET /markets/candlesticks?market_tickers=a,b&start_ts=&end_ts=&period_interval=
+        (documented params; start_ts/end_ts are REQUIRED by the API, in Unix
+        seconds; period_interval: 1, 60, 1440; up to 100 tickers).
+        Returns the raw JSON on success — callers normalize the
+        {"markets": [{market_ticker, candlesticks}]} wrapper.
         """
         if not tickers:
             return None, {"error": "no tickers"}
-        # Kalshi batch endpoint is GET /markets/candlesticks with body-like query
-        # Try documented? https://docs.kalshi.com/api-reference/market/get-market-candlesticks
-        # Search shows /markets/candlesticks and /series/{s}/markets/{t}/candlesticks
-        # We'll try the batch form first.
-        payload_variants = [
-            {"tickers": ",".join(tickers), "period_interval": period_interval, "start_ts": start_ts, "end_ts": end_ts},
-            {"market_tickers": ",".join(tickers), "period_interval": period_interval, "start_ts": start_ts, "end_ts": end_ts},
-            {"tickers": ",".join(tickers), "interval": period_interval, "start_ts": start_ts, "end_ts": end_ts},
-        ]
-        for pl in payload_variants:
-            # filter Nones
-            pl = {k: v for k, v in pl.items() if v is not None}
-            code, j, _ = fetch_with_retry(self.base, "/markets/candlesticks", pl, timeout_ms=self.timeout_ms)
-            if code == 200:
-                return j, None
-            if code in (404, 405):
-                continue
-        # Fallback per-ticker
-        out = {"market_candlesticks": []}
-        for t in tickers:
-            # try GET /markets/{ticker}/candlesticks or /series/... but simpler: /markets/{t}/candlesticks?
-            for path in [f"/markets/{urllib.parse.quote(t, safe='')}/candlesticks", f"/markets/{urllib.parse.quote(t, safe='')}/candlesticks"]:
-                # The single market candlestick often lives at /series/{series}/markets/{ticker}/candlesticks but we don't know series
-                # Test with period_interval query
-                params = {"period_interval": period_interval, "start_ts": start_ts, "end_ts": end_ts}
-                code, j, _ = fetch_with_retry(self.base, path, params, timeout_ms=self.timeout_ms)
-                if code == 200:
-                    out["market_candlesticks"].append(j)
-                    break
-            time.sleep(0.08)
-        if out["market_candlesticks"]:
-            return out, None
-        return None, {"error": "candlesticks endpoint not found for these tickers"}
+        params = {
+            "market_tickers": ",".join(tickers[:100]),
+            "period_interval": period_interval,
+        }
+        if start_ts is not None:
+            params["start_ts"] = start_ts
+        if end_ts is not None:
+            params["end_ts"] = end_ts
+        code, j, _ = fetch_with_retry(self.base, "/markets/candlesticks", params, timeout_ms=self.timeout_ms)
+        if code == 200 and isinstance(j, dict):
+            return j, None
+        # Legacy param-name tolerance (old docs used `tickers`)
+        legacy = {**params, "tickers": params.pop("market_tickers")}
+        code, j, _ = fetch_with_retry(self.base, "/markets/candlesticks", legacy, timeout_ms=self.timeout_ms)
+        if code == 200 and isinstance(j, dict):
+            return j, None
+        return None, j or {"error": f"candlesticks failed (code={code})"}
 
     # historical
     def get_historical_cutoff(self):

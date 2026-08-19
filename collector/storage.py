@@ -50,6 +50,20 @@ def init_db():
     return True
 
 # --- helpers ---
+# Kalshi lifecycle statuses -> this schema's open|closed|settled convention
+_KALSHI_STATUS = {
+    "active": "open",
+    "paused": "closed",
+    "closed": "closed",
+    "determined": "settled",
+    "disputed": "settled",
+    "amended": "settled",
+    "finalized": "settled",
+}
+
+def _normalize_status(s):
+    return _KALSHI_STATUS.get((s or "").lower(), s or "open")
+
 def upsert_event(conn, ticker, title, subtitle="", category="Other", series="", mee=0, close_time="", image_seed=""):
     conn.execute("""
         INSERT INTO events (ticker,title,subtitle,category,series,mutually_exclusive,close_time,image_seed)
@@ -62,36 +76,40 @@ def upsert_event(conn, ticker, title, subtitle="", category="Other", series="", 
 def upsert_market(conn, ticker, event_ticker, title, yes_sub="Yes", no_sub="No",
                   status="open", close_time="", last_price=0, yes_bid=0, yes_ask=0,
                   yes_bid_size=0, yes_ask_size=0, mid=0, volume=0, volume_24h=0,
-                  open_interest=0, prev_price=0, source="kalshi", tick_size=0.01, anchor=None, liquidity=None, rules=""):
-    # Try full upsert including extended columns if they exist, else fallback
-    # Check if columns exist by pragma
-    # Use INSERT ... ON CONFLICT then UPDATE common cols
+                  open_interest=0, prev_price=0, source="kalshi", tick_size=0.01,
+                  anchor=None, liquidity=None, rules="", result=""):
+    status = _normalize_status(status)
+    # Try full upsert including extended columns if they exist, else fallback.
+    # `result` (settlement label YES/NO) is only overwritten when a non-empty
+    # value is provided, so live quote polls don't wipe labels from backfill.
     try:
         conn.execute("""
-            INSERT INTO markets (ticker,event_ticker,title,yes_sub,no_sub,status,close_time,
+            INSERT INTO markets (ticker,event_ticker,title,yes_sub,no_sub,status,result,close_time,
               last_price,yes_bid,yes_ask,yes_bid_size,yes_ask_size,mid,volume,volume_24h,open_interest,prev_price,source,updated_at, tick_size, anchor, liquidity, rules)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ticker) DO UPDATE SET
               last_price=excluded.last_price, yes_bid=excluded.yes_bid, yes_ask=excluded.yes_ask,
               yes_bid_size=excluded.yes_bid_size, yes_ask_size=excluded.yes_ask_size, mid=excluded.mid,
               volume=excluded.volume, volume_24h=excluded.volume_24h, open_interest=excluded.open_interest,
-              prev_price=excluded.prev_price, source=excluded.source, status=excluded.status, updated_at=excluded.updated_at
-        """, (ticker, event_ticker, title, yes_sub, no_sub, status, close_time or "",
+              prev_price=excluded.prev_price, source=excluded.source, status=excluded.status, updated_at=excluded.updated_at,
+              result = CASE WHEN excluded.result = '' THEN markets.result ELSE excluded.result END
+        """, (ticker, event_ticker, title, yes_sub, no_sub, status, result or "", close_time or "",
               last_price or 0, yes_bid or 0, yes_ask or 0, yes_bid_size or 0, yes_ask_size or 0, mid or 0,
               volume or 0, volume_24h or 0, open_interest or 0, prev_price or last_price or 0, source, int(time.time()*1000),
               tick_size or 0.01, anchor if anchor is not None else mid or 0.5, liquidity or 8000, rules or ""))
     except sqlite3.OperationalError as e:
         # fallback without tick_size/anchor/liquidity/rules if schema older
         conn.execute("""
-            INSERT INTO markets (ticker,event_ticker,title,yes_sub,no_sub,status,close_time,
+            INSERT INTO markets (ticker,event_ticker,title,yes_sub,no_sub,status,result,close_time,
               last_price,yes_bid,yes_ask,yes_bid_size,yes_ask_size,mid,volume,volume_24h,open_interest,prev_price,source,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ticker) DO UPDATE SET
               last_price=excluded.last_price, yes_bid=excluded.yes_bid, yes_ask=excluded.yes_ask,
               yes_bid_size=excluded.yes_bid_size, yes_ask_size=excluded.yes_ask_size, mid=excluded.mid,
               volume=excluded.volume, volume_24h=excluded.volume_24h, open_interest=excluded.open_interest,
-              prev_price=excluded.prev_price, source=excluded.source, status=excluded.status, updated_at=excluded.updated_at
-        """, (ticker, event_ticker, title, yes_sub, no_sub, status, close_time or "",
+              prev_price=excluded.prev_price, source=excluded.source, status=excluded.status, updated_at=excluded.updated_at,
+              result = CASE WHEN excluded.result = '' THEN markets.result ELSE excluded.result END
+        """, (ticker, event_ticker, title, yes_sub, no_sub, status, result or "", close_time or "",
               last_price or 0, yes_bid or 0, yes_ask or 0, yes_bid_size or 0, yes_ask_size or 0, mid or 0,
               volume or 0, volume_24h or 0, open_interest or 0, prev_price or last_price or 0, source, int(time.time()*1000)))
 

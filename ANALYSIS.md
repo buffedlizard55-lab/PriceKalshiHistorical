@@ -1,5 +1,7 @@
 # PriceKalshiHistorical — What Can Be Done & Hard Limitations
 
+> *Last verified 2026-08-18 against docs.kalshi.com (OpenAPI v3.28.0), the live third-party sources, and this repo's code — see REVIEW.md. Corrections from that verification pass are folded in below.*
+
 **Goal:** collect Kalshi price/volume/liquidity/orderbook history to backtest profitable entry/exit strategies and train a prediction model.
 
 **Bottom line up front:**
@@ -17,8 +19,9 @@
 ## 1) Official Kalshi API — what it actually exposes
 
 Base URLs (same API, different hosts):
-- `https://api.elections.kalshi.com/trade-api/v2` (primary) [6](https://predscope.com/guide/kalshi-api)
-- `https://trading-api.kalshi.com/trade-api/v2` / `https://demo-api.kalshi.co/trade-api/v2` (demo) [6](https://predscope.com/guide/kalshi-api)
+- `https://external-api.kalshi.com/trade-api/v2` (recommended) / `https://api.elections.kalshi.com/trade-api/v2` (shared host, still supported) [6](https://predscope.com/guide/kalshi-api)
+- `https://external-api.demo.kalshi.co/trade-api/v2` (demo recommended) / `https://demo-api.kalshi.co/trade-api/v2` (demo) [6](https://predscope.com/guide/kalshi-api)
+- *(Do not use `trading-api.kalshi.com` — a pre-2023 legacy host from the old kalshi-python SDK.)*
 
 Auth: **public** market-data reads need no key; trading/portfolio needs RSA-PSS per-request signing [5](https://pm.wiki/learn/kalshi-api). Real SDK: `kalshi-python`.
 
@@ -28,12 +31,12 @@ Auth: **public** market-data reads need no key; trading/portfolio needs RSA-PSS 
 |---|---|---|
 | `GET /markets` + `GET /markets/{ticker}` | All active markets: ticker, title, `yes_bid_dollars` / `yes_ask_dollars`, `last_price_dollars`, `volume` / `volume_24h` (`volume_fp`), `open_interest_fp`, `close_time`, `status`, `yes_bid_size` etc. | Pagination cursor-based, up to 1000 per page [5](https://pm.wiki/learn/kalshi-api) |
 | `GET /events`, `GET /events/{ticker}`, `GET /series` | Event/series metadata, `mutually_exclusive` flag (critical for arbitrage), categories | `with_nested_markets=true` on events |
-| `GET /markets/{ticker}/orderbook` | **Current** L2 `yes`/`no` bids & asks `[price_cents, size]` — full depth *right now* | Public in practice despite spec saying auth [5](https://pm.wiki/learn/kalshi-api) |
-| `GET /markets/orderbooks` | Batch current books for up to 100 tickers | Added Mar 2026 [6](https://predscope.com/guide/kalshi-api) |
+| `GET /markets/{ticker}/orderbook` | **Current** full-depth book: `orderbook_fp.yes_dollars` / `no_dollars` = `[price_string, count_fp_string]` levels. **Bids only** — a YES bid at p ≡ a NO ask at (1−p), so YES asks are derived from NO bids | Public in practice despite the spec listing auth headers [5](https://pm.wiki/learn/kalshi-api) |
+| `GET /markets/orderbooks` | Batch current books for up to 100 tickers (`?tickers=a,b,…`) | Spec lists auth for this one; single-book reads work unsigned in practice |
 | `GET /markets/trades` | Recent trade tape (cross-market, paginated) | Historical trades older than cutoff move to `/historical/trades` |
 | `GET /markets/candlesticks` + `GET /series/{s}/markets/{t}/candlesticks` | OHLCV candles per market: intervals `1` (1m), `60` (1h), `1440` (1d) [4](https://docs.predexon.com/api-reference/kalshi/orderbooks) | Batch endpoint: up to 100 markets / 10k candles per call; per-market endpoint similar. `yes_bid/open/close`, `yes_ask`, `price`, `volume_fp` |
-| `GET /events/{ticker}/candlesticks` | Event-level candlesticks | [9](https://docs.kalshi.com/api-reference/events/get-event-candlesticks) |
-| WebSocket `wss://api.elections.kalshi.com/trade-api/ws/v2` | Live `orderbook`, `ticker`, `trade` streams | Realtime only, no replay [6](https://predscope.com/guide/kalshi-api) |
+| `GET /series/{series_ticker}/events/{ticker}/candlesticks` | Event-level candlesticks | [9](https://docs.kalshi.com/api-reference/events/get-event-candlesticks) |
+| WebSocket `wss://api.elections.kalshi.com/trade-api/ws/v2` (alt: `wss://external-api-ws.kalshi.com/trade-api/ws/v2`) | Live `ticker` / `trade` (public channels) + `orderbook_delta` (**private** channel); the WS handshake itself requires signed headers | Realtime only, no replay [6](https://predscope.com/guide/kalshi-api) |
 
 ### Authenticated (your account only)
 
@@ -66,7 +69,7 @@ Token-bucket, per-tier. Basic ≈ **20 req/s** (each call ≈10 tokens) [2](http
 **1. No official historical orderbook.**
 > "Kalshi's public API is great for live data, but it does not expose historical order book snapshots — only trades and candles. We continuously poll Kalshi's live order book and persist the bid/ask depth..." [1](https://kalshibacktest.com/) / [8](https://kalshibacktest.com/)
 
-You can call `/markets/{ticker}/orderbook` *today* and get the book *now*. You cannot ask "what did the book at 14:32:11 on 2025-11-04 look like?" unless you recorded it yourself. There is no `/historical/orderbook`. The only retroactive L2 is via third parties (Dome [1](https://docs.domeapi.io/api-reference/endpoint/get-kalshi-orderbook-history), Predexon [4](https://docs.predexon.com/api-reference/kalshi/orderbooks) since Jan 2026, Lychee since July 2021 [3](https://lycheedata.com/kalshi-historical-data), etc.) — and those are paid.
+You can call `/markets/{ticker}/orderbook` *today* and get the book *now*. You cannot ask "what did the book at 14:32:11 on 2025-11-04 look like?" unless you recorded it yourself. There is no `/historical/orderbook`. The only retroactive L2 is via third parties (Dome [1](https://docs.domeapi.io/api-reference/endpoint/get-kalshi-orderbook-history), Predexon [4](https://docs.predexon.com/api-reference/kalshi/orderbooks) since Jan 2026, Lychee since July 2021 [3](https://lycheedata.com/kalshi-historical-data), etc.). Most are paid, though Predexon's orderbook-history endpoint is documented as free-tier.
 
 **Implication:** Any strategy whose fill assumption depends on *spread, depth, queue, or price improvement* cannot be faithfully backtested on pure official history. Your backtest will look better than reality (you assume `mid` fills when the real ask was 4¢ wide).
 
@@ -91,7 +94,7 @@ Market-wide order flow is *not* exposed. `GET /portfolio/fills` and `GET /histor
 Every contract settles binary `$1` (Yes wins) or `$0` (No). Fees are **quadratic**: `fee = 0.07 × contracts × p × (1-p)` on taker flow (the clone implements this correctly; the real Kalshi schedule is similar but tiered by volume). A backtest that ignores fees or assumes frictionless entry at `mid` will overstate edge by ~2-7¢/round-trip on liquid names, much more on wide books.
 
 **8. Market heterogeneity.**
-32+ categories in the wild (the clone seeds 32 events/90 markets as an example: Politics, Economics, Crypto, Sports, Weather, Science & Tech, Culture, Companies). Your model will see very different microstructure across a 15-min BTC up/down market vs a 700-day political nominee market — you cannot pool them without serious normalization.
+8+ top-level categories in the wild — Sports, Politics, Culture, Economics, Crypto, Climate/Weather, Finance, Entertainment, Science (the clone seeds 32 events/92 markets as an example across 8 of them: Politics, Economics, Crypto, Sports, Weather, Science & Tech, Culture, Companies). Your model will see very different microstructure across a 15-min BTC up/down market vs a 700-day political nominee market — you cannot pool them without serious normalization.
 
 ---
 
@@ -110,7 +113,7 @@ It has **two modes sharing one frontend** (`docs/js/app.js` auto-probes `/api/he
 
 **A. Fully worked storage schema you'd want to copy**
 
-`server/db.js` defines 9 tables already tailored for a companion analysis repo (`snapshots`, `book_snapshots`, `candles`, `anomalies` etc.):
+`server/db.js` defines 10 tables already tailored for a companion analysis repo (`snapshots`, `book_snapshots`, `candles`, `anomalies` etc.):
 
 ```sql
 events(ticker, title, category, mutually_exclusive, close_time)
@@ -128,9 +131,9 @@ You can literally `sqlite3 data/exchange.db` or open it from Python `sqlite3` �
 **B. Continuous price history (synthetic, but real-shaped)**
 
 `server/engine.js`:
-- Latent fair value `p` per market mean-reverts to `anchor` (the catalog's prior probability): `dp = (anchor - p)*0.006 + N(0, volBase)` with `volBase = 0.0016 + 0.006*p*(1-p)` + 0.4% news jumps.
-- 7-level L2 book rebuilt every `TICK_MS=1000` around `mid`, tighter when `liquidity >15000` (1¢ spread) else 1-2¢, quantities `sizeAt(liquidity, level)`.
-- Organic flow: Poisson taker hits (`λ ≈ 0.02–0.55` scaled by liquidity) that walk the book, print `last`, bump `volume/v24/OI`, and push a `tape` (last 80 trades).
+- Latent fair value `p` per market mean-reverts to `anchor` (the catalog's prior probability): `dp = (anchor - p)*0.006 + N(0, volBase)` with `volBase = 0.0016 + 0.006*p*(1-p)` + 0.4% news jumps (noise ×1.8 when <2 days to close).
+- 7-level L2 book rebuilt every `TICK_MS=1000` around `mid`, tighter when `liquidity >6000` (1¢ spread) else 2¢ (also forced to 1¢ when mid ≤3¢ or ≥97¢), quantities `sizeAt(liquidity, level)`.
+- Organic flow: Bernoulli taker hits per tick (`p ≈ 0.02–0.55` scaled by liquidity, ×1.8 near close) that walk the book, print `last`, bump `volume/v24/OI`, and push a `tape` (last 80 trades).
 - Candle seeding: **60 days of `1h`** + **12h of `1m`** per market generated by a backward random walk ending at `anchor`; then live `1m` bars aggregated as trades arrive; `15m`/`1d` derived on read via `aggregate()` in `server/index.js`.
 - Snapshots every `5s`, book snapshots every `15s`.
 - Settlement: markets past `close_time` resolve Yes/No sampled from fair value and pay positions `$1/$0`.
@@ -163,7 +166,7 @@ Runs every `8s`:
 | `mee_sum` | `|Σ mids - 1| > 2.5¢` on mutually-exclusive events | Cross-market drift feature |
 | `mee_arb` | `Σ asks < 99¢` (buy all Yes) or `Σ bids > 101¢` (sell all) | Hard arbitrage label |
 | `wide_spread` | spread ≥4 ticks on vol>500 | Liquidity regime feature |
-| `fast_move` | ≥5¢ move within 5 min | Volatility / news shock |
+| `fast_move` | ≥5¢ move vs a reference mid ≤10 min old | Volatility / news shock |
 
 Exposed as `GET /api/analysis/anomalies?kind=` and `GET /api/analysis/mee` (MEE sums table). The README explicitly says this layer was "built for the pricing-irregularities repo" — i.e., for *you*.
 
@@ -217,7 +220,7 @@ For 15-min crypto up/down markets you can *buy* ultra-high-res history today: **
 
 ### Feasible with full third-party archive (pay to skip ETL)
 
-- **Lychee:** 36GB+, 7.68M markets, 72.1M trades since July 2021, every market+trade+orderbook behavior + CSV/ParquetNoCode [3](https://lycheedata.com/kalshi-historical-data)
+- **Lychee:** 36GB+, 7.68M markets, 72.1M trades since July 2021, all markets + trades + orderbook history *where available*, CSV/XLSX/JSON exports [3](https://lycheedata.com/kalshi-historical-data)
 - **Predexon:** tick-level orderbook since Jan 7 2026, Parquet dumps, normalized with Polymarket [2](https://www.turbinefi.com/blog/historical-prediction-market-data-backtesting-2026)
 - **Dome:** orderbook history from Oct 29 2025 via `api.domeapi.io` [1](https://docs.domeapi.io/api-reference/endpoint/get-kalshi-orderbook-history)
 - **Allium:** warehouse/SQL orderbook tables
@@ -229,9 +232,9 @@ Use these if you need *instant* multi-year L2 for backtesting across all categor
 ## 5) Concrete limitations checklist for your prediction model
 
 - [ ] **Lookahead / survivorship:** If you build your universe from today's `GET /markets?status=open`, you exclude expired markets that settled 0 — your training set is biased toward markets that survived. Always union `GET /historical/markets` for labels.
-- [ ] **Stale quotes:** Illiquid markets (liquidity 4k–6k in the catalog, e.g., `KXAGI26-Y`, `KXROBOTAXI26-Y`) can have 4-tick+ spreads and update once per hour. Your "price" feature is stale — weight by spread & `updated_at`.
+- [ ] **Stale quotes:** Illiquid markets (liquidity 4k–6k in the catalog, e.g., `KXPRES28DEM-CBOOKER`, `KXPRES28GOP-TSCOTT`) can have 4-tick+ spreads and update once per hour. Your "price" feature is stale — weight by spread & `updated_at`.
 - [ ] **Time decay:** Binary contracts converge to 0/1 near `close_time` with nonlinear theta. A model trained on 700-day politics markets will misprice 1-day MLB moneylines.
-- [ ] **Fee drag:** Net edge = gross edge − `0.07·p·(1-p)` per contract + spread. On a 50¢ market with 2¢ spread, you need >5¢ edge to break even round-trip.
+- [ ] **Fee drag:** Net edge = gross edge − `0.07·p·(1-p)` per contract + spread. On a 50¢ market with 2¢ spread you need ≈5.5¢ edge to break even round-trip (2× 1.75¢ fees + 2¢ spread).
 - [ ] **MEE constraint:** On `mutually_exclusive` events, `Σ mids ≈ 1` (or legitimately <1 when field incomplete). Treating outcomes independently double-counts probability.
 - [ ] **Class imbalance:** Most markets settle No; Yes is rare. Use Brier score / log loss, not raw accuracy.
 - [ ] **Regime shift:** Pre-2025 Kalshi had different market designs; post-2026 has sub-cent pricing and historical partitioning — features must be normalized.
@@ -300,7 +303,7 @@ PriceKalshiHistorical/
 
 | Capability | Official Kalshi API | Clone (`karagemop466-tech/Kalshi`) | Third-party archive |
 |---|---|---|---|
-| Markets/events/series history | Live 3mo + `/historical/markets` forever [2](https://docs.kalshi.com/getting_started/historical_data) | 32 events / 90 markets synthetic catalog (`server/catalog.js`) | Mirrors official + ETL'd (Lychee 2021→present [3](https://lycheedata.com/kalshi-historical-data)) |
+| Markets/events/series history | Live 3mo + `/historical/markets` forever [2](https://docs.kalshi.com/getting_started/historical_data) | 32 events / 92 markets synthetic catalog (`server/catalog.js`) | Mirrors official + ETL'd (Lychee 2021→present [3](https://lycheedata.com/kalshi-historical-data)) |
 | Prices `mid/bid/ask/last` | Current via `/markets`, historic via `/candlesticks` (`1m/1h/1d`) | 5s `snapshots(ts,mid,bid,ask,last)` seeded 60d 1h +12h 1m, then live | Tick-level if they captured (Predexon since Jan 2026 [4](https://docs.predexon.com/api-reference/kalshi/orderbooks)) |
 | Volume / OI / liquidity timeseries | No — scalar `volume_fp/volume_24h_fp/open_interest_fp` per market | 5s `volume_24h` + 7-level sizes derived from `liquidity/25` | Same as official unless they polled |
 | Orderbook depth history | **No** — live `GET /orderbook` only [1](https://kalshibacktest.com/) | 15s `book_snapshots(bids,asks JSON)` 7 levels, synthetic | Yes (Dome [1](https://docs.domeapi.io/api-reference/endpoint/get-kalshi-orderbook-history), Predexon [4](https://docs.predexon.com/api-reference/kalshi/orderbooks), Lychee) |

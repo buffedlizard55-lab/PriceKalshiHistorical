@@ -33,10 +33,10 @@ async function syncOnce() {
     const eventTickers = [...new Set(markets.map(m => m.event_ticker))];
     let eventMeta = new Map();
     try {
-      // batch fetch event metadata (best effort)
+      // batch fetch event metadata (best effort); documented filter param is `tickers`
       for (let i = 0; i < eventTickers.length; i += 50) {
         const slice = eventTickers.slice(i, i + 50).join(',');
-        const ev = await fetchJson(`/events?event_tickers=${encodeURIComponent(slice)}&limit=50`);
+        const ev = await fetchJson(`/events?tickers=${encodeURIComponent(slice)}&limit=50`);
         for (const e of ev.events || []) eventMeta.set(e.event_ticker, e);
       }
     } catch (e) { /* events metadata is optional */ }
